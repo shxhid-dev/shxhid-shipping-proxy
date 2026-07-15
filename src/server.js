@@ -80,6 +80,19 @@ app.post('/api/shipping-estimate', limiter, async (req, res) => {
   }
 });
 
+// ── Error handler ────────────────────────────────────────────────────────
+// Catches CORS rejections (thrown from corsOptions.origin) and anything else
+// that bubbles up, so callers get a clean JSON response instead of Express's
+// default HTML error page, and every failure is logged server-side.
+app.use((err, req, res, _next) => {
+  if (err && /not allowed by CORS/.test(err.message)) {
+    console.warn(`[cors] rejected origin: ${req.headers.origin}`);
+    return res.status(403).json({ error: 'Origin not allowed.' });
+  }
+  console.error('[error]', err.message);
+  return res.status(500).json({ error: 'Internal server error.' });
+});
+
 app.listen(PORT, () => {
   console.log(`oto-shipping-proxy listening on :${PORT} (origin city: ${ORIGIN_CITY})`);
   startProactiveRefresh();
