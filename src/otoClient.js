@@ -82,7 +82,7 @@ async function checkOTODeliveryFee({
   totalDue,
   serviceType,
 }) {
-  // Local-dev mock: prove the full path (map + response shape) with no token.
+  // Local-dev mock: prove the full path (map + response shape) with no token
   // Set OTO_MOCK=true in your local .env. NEVER enable this on Railway.
   if (String(process.env.OTO_MOCK).toLowerCase() === 'true') {
     return mockDeliveryFeeResponse({ originCity, destinationCity, weight });
