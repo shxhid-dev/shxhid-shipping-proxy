@@ -5,6 +5,12 @@
 const OTO_API_BASE = process.env.OTO_API_BASE || 'https://api.tryoto.com';
 const REFRESH_TOKEN = process.env.OTO_REFRESH_TOKEN;
 
+// Network hardening knobs (overridable via env, sane defaults).
+const OTO_TIMEOUT_MS = Number(process.env.OTO_TIMEOUT_MS) || 10_000;
+const OTO_MAX_RETRIES = Number.isFinite(Number(process.env.OTO_MAX_RETRIES))
+  ? Number(process.env.OTO_MAX_RETRIES)
+  : 2;
+
 // In-memory access-token cache.
 let accessToken = null;
 let accessTokenExpiresAt = 0; // epoch ms
@@ -24,6 +30,55 @@ function assertConfigured() {
   }
 }
 
+// Non-secret readiness snapshot for the health endpoint. Never exposes the
+// token value — only whether one is configured and whether a live access
+// token is currently cached.
+function getTokenStatus() {
+  return {
+    configured: Boolean(REFRESH_TOKEN),
+    hasAccessToken: Boolean(accessToken) && Date.now() < accessTokenExpiresAt,
+  };
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Exponential backoff with a ceiling: 300ms, 600ms, 1200ms, … capped at 2s.
+function backoffMs(attempt) {
+  return Math.min(2000, 300 * 2 ** attempt);
+}
+
+// fetch() with an abort-based timeout so a hung OTO connection can't hang the
+// whole request. Throws an AbortError if the timeout fires.
+async function fetchWithTimeout(url, options = {}, timeoutMs = OTO_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Retry a request on TRANSIENT failures only — timeouts, connection resets,
+// DNS blips. HTTP error statuses are returned as-is for the caller to handle
+// (a 4xx won't get better by retrying). Never logs headers/body/token.
+async function fetchWithRetry(url, options, { timeoutMs = OTO_TIMEOUT_MS, retries = OTO_MAX_RETRIES, label = 'request' } = {}) {
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await fetchWithTimeout(url, options, timeoutMs);
+    } catch (err) {
+      lastErr = err;
+      const isLast = attempt === retries;
+      const reason = err.name === 'AbortError' ? `timeout after ${timeoutMs}ms` : err.message;
+      console.warn(`[oto] ${label} attempt ${attempt + 1}/${retries + 1} failed (${reason})${isLast ? '' : ' — retrying'}`);
+      if (isLast) break;
+      await sleep(backoffMs(attempt));
+    }
+  }
+  throw lastErr;
+}
+
 // Exchange the refresh_token for a fresh access_token. De-duplicated so
 // concurrent callers share one in-flight refresh.
 async function refreshAccessToken() {
@@ -31,11 +86,15 @@ async function refreshAccessToken() {
   if (refreshInFlight) return refreshInFlight;
 
   refreshInFlight = (async () => {
-    const res = await fetch(`${OTO_API_BASE}/rest/v2/refreshToken`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ refresh_token: REFRESH_TOKEN }),
-    });
+    const res = await fetchWithRetry(
+      `${OTO_API_BASE}/rest/v2/refreshToken`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refresh_token: REFRESH_TOKEN }),
+      },
+      { label: 'refreshToken' }
+    );
 
     if (!res.ok) {
       const detail = await safeReadText(res);
@@ -82,13 +141,11 @@ async function checkOTODeliveryFee({
   totalDue,
   serviceType,
 }) {
-  // Local-dev mock: prove the full path (map + response shape) with no token
+  // Local-dev mock: prove the full path (map + response shape) with no token.
   // Set OTO_MOCK=true in your local .env. NEVER enable this on Railway.
   if (String(process.env.OTO_MOCK).toLowerCase() === 'true') {
     return mockDeliveryFeeResponse({ originCity, destinationCity, weight });
   }
-
-  const token = await getAccessToken();
 
   const body = { originCity, destinationCity, weight };
   if (length != null) body.length = length;
@@ -97,27 +154,26 @@ async function checkOTODeliveryFee({
   if (totalDue != null) body.totalDue = totalDue;
   if (serviceType != null) body.serviceType = serviceType;
 
-  let res = await fetch(`${OTO_API_BASE}/rest/v2/checkOTODeliveryFee`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify(body),
-  });
+  const call = (token) =>
+    fetchWithRetry(
+      `${OTO_API_BASE}/rest/v2/checkOTODeliveryFee`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(body),
+      },
+      { label: 'checkOTODeliveryFee' }
+    );
+
+  let res = await call(await getAccessToken());
 
   // If the token was rejected (expired early / revoked), refresh once and retry.
   if (res.status === 401 || res.status === 403) {
     console.log('[oto] delivery-fee call got', res.status, '- refreshing token and retrying');
-    const fresh = await refreshAccessToken();
-    res = await fetch(`${OTO_API_BASE}/rest/v2/checkOTODeliveryFee`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${fresh}`,
-      },
-      body: JSON.stringify(body),
-    });
+    res = await call(await refreshAccessToken());
   }
 
   if (!res.ok) {
@@ -144,6 +200,7 @@ function startProactiveRefresh() {
   }, PROACTIVE_REFRESH_MS);
   // Don't keep the event loop alive just for the refresh timer.
   if (typeof timer.unref === 'function') timer.unref();
+  return timer;
 }
 
 // Canned response shaped like OTO's checkOTODeliveryFee for local testing.
@@ -198,4 +255,5 @@ export {
   refreshAccessToken,
   startProactiveRefresh,
   assertConfigured,
+  getTokenStatus,
 };
