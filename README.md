@@ -67,7 +67,12 @@ Key ones:
 | `ORIGIN_CITY`          | Warehouse city goods ship from. This store: `Dubai`.                  |
 | `INCLUDE_COD_IN_PRICE` | `false` — we surface COD separately as a note, not folded into price. |
 | `ALLOWED_ORIGINS`      | Comma-separated CORS allow-list of your storefront domains.           |
-| `RATE_LIMIT_MAX` / `RATE_LIMIT_WINDOW_MS` | Public-endpoint rate limit (default 30 / 60s).     |
+| `RATE_LIMIT_MAX` / `RATE_LIMIT_WINDOW_MS` | Estimate-endpoint rate limit (default 30 / 60s).   |
+| `GLOBAL_RATE_LIMIT_MAX` / `GLOBAL_RATE_LIMIT_WINDOW_MS` | Baseline all-route limit (default 120 / 60s; `/health` exempt). |
+| `ESTIMATE_CACHE_TTL_MS` | In-memory cache for repeat lookups (default 120000; `0` disables).   |
+| `OTO_TIMEOUT_MS`       | Per-request timeout on OTO calls (default 10000).                     |
+| `OTO_MAX_RETRIES`      | Retries on transient OTO network failures/timeouts (default 2).       |
+| `MAX_WEIGHT_KG`        | Reject `weightKg` above this before calling OTO (default 1000).       |
 | `OTO_MOCK`             | `true` = return canned data with no token. **Local dev only.**        |
 
 ---
