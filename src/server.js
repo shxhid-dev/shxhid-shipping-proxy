@@ -7,7 +7,10 @@ import { checkOTODeliveryFee, startProactiveRefresh, getTokenStatus } from './ot
 
 const app = express();
 app.disable('x-powered-by'); // don't advertise the framework
-app.set('trust proxy', 1); // Railway sits behind a proxy; needed for correct client IPs
+// Railway sits behind a single edge proxy that appends the real client IP to
+// X-Forwarded-For. trust proxy: 1 reads that correctly. Do NOT use `true`
+// (permissive) — it would let clients spoof their IP past the rate limiter.
+app.set('trust proxy', 1);
 
 const PORT = process.env.PORT || 3000;
 const ORIGIN_CITY = process.env.ORIGIN_CITY || 'Dubai';
@@ -17,6 +20,16 @@ const STARTED_AT = Date.now();
 // Input bounds — reject obviously bad payloads before they reach OTO.
 const MAX_CITY_LEN = 100;
 const MAX_WEIGHT_KG = Number(process.env.MAX_WEIGHT_KG) || 1000;
+
+// Short-lived in-memory cache for estimates. OTO fees for the same route and
+// weight don't change second-to-second, so caching cuts upstream calls, speeds
+// up repeat lookups, and shields us from OTO's own rate limits. Display-only
+// estimate, so a couple of minutes of staleness is fine. Set TTL=0 to disable.
+const CACHE_TTL_MS = Number.isFinite(Number(process.env.ESTIMATE_CACHE_TTL_MS))
+  ? Number(process.env.ESTIMATE_CACHE_TTL_MS)
+  : 120_000;
+const CACHE_MAX_ENTRIES = 500;
+const estimateCache = new Map(); // key -> { at, value }
 
 // ── CORS: restrict to the storefront domain(s) ──────────────────────────────
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
@@ -39,16 +52,40 @@ const corsOptions = {
   methods: ['POST', 'GET', 'OPTIONS'],
 };
 
+// ── Lightweight request logging (no secrets, no bodies) ─────────────────────
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    console.log(`[req] ${req.method} ${req.originalUrl} ${res.statusCode} ${Date.now() - start}ms`);
+  });
+  next();
+});
+
 app.use(cors(corsOptions));
 app.use(express.json({ limit: '16kb' }));
 
-// ── Rate limit the public estimate endpoint ─────────────────────────────────
-const limiter = rateLimit({
+// ── Rate limiting ────────────────────────────────────────────────────────
+const rateLimitMessage = { error: 'Too many requests, please slow down.' };
+
+// Baseline limiter across every route (except health) as blanket abuse
+// protection. Health is skipped so Railway's probes are never throttled.
+const globalLimiter = rateLimit({
+  windowMs: Number(process.env.GLOBAL_RATE_LIMIT_WINDOW_MS) || 60_000,
+  max: Number(process.env.GLOBAL_RATE_LIMIT_MAX) || 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.path === '/health',
+  message: rateLimitMessage,
+});
+app.use(globalLimiter);
+
+// Stricter limiter specifically for the public estimate endpoint.
+const estimateLimiter = rateLimit({
   windowMs: Number(process.env.RATE_LIMIT_WINDOW_MS) || 60_000,
   max: Number(process.env.RATE_LIMIT_MAX) || 30,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'Too many requests, please slow down.' },
+  message: rateLimitMessage,
 });
 
 // ── Health check (handy for Railway) ────────────────────────────────────────
@@ -66,7 +103,7 @@ app.get('/health', (_req, res) => {
 
 // ── Public storefront endpoint ──────────────────────────────────────────────
 // POST /api/shipping-estimate  { destinationCity, weightKg, totalDue? }
-app.post('/api/shipping-estimate', limiter, async (req, res) => {
+app.post('/api/shipping-estimate', estimateLimiter, async (req, res) => {
   try {
     const { destinationCity, weightKg, totalDue } = req.body || {};
 
@@ -94,6 +131,12 @@ app.post('/api/shipping-estimate', limiter, async (req, res) => {
       }
     }
 
+    const cacheKey = `${city.toLowerCase()}|${weight}|${due ?? ''}`;
+    const cached = cacheGet(cacheKey);
+    if (cached) {
+      return res.json({ originCity: ORIGIN_CITY, destinationCity: city, weightKg: weight, options: cached, cached: true });
+    }
+
     const raw = await checkOTODeliveryFee({
       originCity: ORIGIN_CITY,
       destinationCity: city,
@@ -102,7 +145,11 @@ app.post('/api/shipping-estimate', limiter, async (req, res) => {
     });
 
     const options = mapDeliveryOptions(raw);
-    return res.json({ originCity: ORIGIN_CITY, destinationCity: city, weightKg: weight, options });
+    // Only cache non-empty results — an empty list may be a transient upstream
+    // hiccup and we don't want to pin "no options" for the whole TTL.
+    if (options.length > 0) cacheSet(cacheKey, options);
+
+    return res.json({ originCity: ORIGIN_CITY, destinationCity: city, weightKg: weight, options, cached: false });
   } catch (err) {
     console.error('[estimate] error:', err.message);
     // Never leak tokens or internal detail to the browser.
@@ -160,6 +207,31 @@ function shutdown(signal) {
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+
+// ── Cache helpers ─────────────────────────────────────────────────────────
+
+function cacheGet(key) {
+  if (CACHE_TTL_MS <= 0) return null;
+  const hit = estimateCache.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.at > CACHE_TTL_MS) {
+    estimateCache.delete(key);
+    return null;
+  }
+  // Refresh recency so the Map's insertion order approximates LRU.
+  estimateCache.delete(key);
+  estimateCache.set(key, hit);
+  return hit.value;
+}
+
+function cacheSet(key, value) {
+  if (CACHE_TTL_MS <= 0) return;
+  if (estimateCache.size >= CACHE_MAX_ENTRIES) {
+    const oldest = estimateCache.keys().next().value;
+    if (oldest !== undefined) estimateCache.delete(oldest);
+  }
+  estimateCache.set(key, { at: Date.now(), value });
+}
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
