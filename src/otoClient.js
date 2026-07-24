@@ -2,6 +2,8 @@
 // The refresh_token and access_token live ONLY here, server-side. They are
 // never returned to callers, never logged in plaintext.
 
+import { logger } from './logger.js';
+
 const OTO_API_BASE = process.env.OTO_API_BASE || 'https://api.tryoto.com';
 const REFRESH_TOKEN = process.env.OTO_REFRESH_TOKEN;
 
@@ -15,9 +17,15 @@ const OTO_MAX_RETRIES = Number.isFinite(Number(process.env.OTO_MAX_RETRIES))
 let accessToken = null;
 let accessTokenExpiresAt = 0; // epoch ms
 
+// Whether the current token has been used by a real request since it was last
+// refreshed. Gates proactive refresh so an idle store stops refreshing (and
+// stops spamming the logs) instead of burning a refresh call every cycle.
+let tokenUsedSinceRefresh = false;
+
 // OTO access tokens last ~1 hour. Refresh proactively before that.
 const TOKEN_TTL_MS = 55 * 60 * 1000; // treat token as good for 55 min
-const PROACTIVE_REFRESH_MS = 55 * 60 * 1000; // background refresh cadence
+// Background refresh cadence (overridable, mainly for testing). Default 55 min.
+const PROACTIVE_REFRESH_MS = Number(process.env.OTO_PROACTIVE_REFRESH_MS) || 55 * 60 * 1000;
 
 let refreshInFlight = null;
 
@@ -71,7 +79,7 @@ async function fetchWithRetry(url, options, { timeoutMs = OTO_TIMEOUT_MS, retrie
       lastErr = err;
       const isLast = attempt === retries;
       const reason = err.name === 'AbortError' ? `timeout after ${timeoutMs}ms` : err.message;
-      console.warn(`[oto] ${label} attempt ${attempt + 1}/${retries + 1} failed (${reason})${isLast ? '' : ' — retrying'}`);
+      logger.warn('OTO request failed', { call: label, attempt: `${attempt + 1}/${retries + 1}`, reason, retrying: !isLast });
       if (isLast) break;
       await sleep(backoffMs(attempt));
     }
@@ -80,12 +88,13 @@ async function fetchWithRetry(url, options, { timeoutMs = OTO_TIMEOUT_MS, retrie
 }
 
 // Exchange the refresh_token for a fresh access_token. De-duplicated so
-// concurrent callers share one in-flight refresh.
-async function refreshAccessToken() {
+// concurrent callers share one in-flight refresh. `trigger` is for logging.
+async function refreshAccessToken(trigger = 'on-demand') {
   assertConfigured();
   if (refreshInFlight) return refreshInFlight;
 
   refreshInFlight = (async () => {
+    const t0 = Date.now();
     const res = await fetchWithRetry(
       `${OTO_API_BASE}/rest/v2/refreshToken`,
       {
@@ -112,7 +121,8 @@ async function refreshAccessToken() {
 
     accessToken = token;
     accessTokenExpiresAt = Date.now() + TOKEN_TTL_MS;
-    console.log('[oto] access token refreshed; valid ~55m');
+    tokenUsedSinceRefresh = false;
+    logger.info('OTO access token refreshed', { trigger, validForMin: 55, ms: Date.now() - t0 });
     return accessToken;
   })();
 
@@ -127,7 +137,7 @@ async function getAccessToken() {
   if (accessToken && Date.now() < accessTokenExpiresAt) {
     return accessToken;
   }
-  return refreshAccessToken();
+  return refreshAccessToken('expired');
 }
 
 // Call OTO's delivery-fee endpoint and return the raw parsed response.
@@ -168,34 +178,44 @@ async function checkOTODeliveryFee({
       { label: 'checkOTODeliveryFee' }
     );
 
+  const t0 = Date.now();
+  tokenUsedSinceRefresh = true;
   let res = await call(await getAccessToken());
 
   // If the token was rejected (expired early / revoked), refresh once and retry.
   if (res.status === 401 || res.status === 403) {
-    console.log('[oto] delivery-fee call got', res.status, '- refreshing token and retrying');
-    res = await call(await refreshAccessToken());
+    logger.warn('OTO delivery-fee auth rejected — refreshing token and retrying', { status: res.status });
+    res = await call(await refreshAccessToken('401-retry'));
   }
 
   if (!res.ok) {
     const detail = await safeReadText(res);
+    logger.warn('OTO delivery-fee failed', { status: res.status, ms: Date.now() - t0 });
     throw new Error(
       `OTO checkOTODeliveryFee failed (HTTP ${res.status}). ${truncate(detail, 300)}`
     );
   }
 
+  logger.debug('OTO delivery-fee ok', { status: res.status, ms: Date.now() - t0 });
   return res.json();
 }
 
 // Kick off a background refresh loop so tokens are warm before they expire.
-// Never crash the process on a transient refresh failure.
+// Never crash the process on a transient refresh failure. Activity-gated:
+// only refreshes if the token was actually used since the last refresh, so an
+// idle store goes quiet instead of refreshing (and logging) every cycle.
 function startProactiveRefresh() {
   if (!REFRESH_TOKEN) return; // nothing to refresh yet
-  refreshAccessToken().catch((err) =>
-    console.error('[oto] initial token refresh failed:', err.message)
+  refreshAccessToken('startup').catch((err) =>
+    logger.error('initial token refresh failed', { error: err.message })
   );
   const timer = setInterval(() => {
-    refreshAccessToken().catch((err) =>
-      console.error('[oto] scheduled token refresh failed:', err.message)
+    if (!tokenUsedSinceRefresh) {
+      logger.debug('proactive refresh skipped (idle since last refresh)');
+      return;
+    }
+    refreshAccessToken('proactive').catch((err) =>
+      logger.error('scheduled token refresh failed', { error: err.message })
     );
   }, PROACTIVE_REFRESH_MS);
   // Don't keep the event loop alive just for the refresh timer.
