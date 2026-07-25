@@ -1,0 +1,428 @@
+{%- comment -%}
+  Shipping-fee cart estimator (Shopify snippet).
+
+  This file is the SOURCE OF TRUTH for the storefront widget. It lives in the
+  backend repo so frontend and backend stay in sync. To deploy: copy its
+  contents into the Shopify theme at snippets/shipping-estimate.liquid, and
+  render it from sections/main-cart-footer.liquid with:
+      {% render 'shipping-estimate' %}
+
+  Calls the OTO shipping proxy (Railway) with the shopper's destination city
+  and the cart's total weight, and renders a list of carrier options.
+  Display-only — does not change what Shopify charges at checkout.
+
+  Country/city lists are curated to what OTO's connected carriers can
+  realistically quote from a Dubai origin (GCC/Middle East, plus a few
+  international lanes DHL/FedEx cover) — not all 195 countries, since OTO
+  isn't a true worldwide rate engine and unlisted destinations just return
+  "no delivery options."
+{%- endcomment -%}
+
+{%- unless cart == empty -%}
+  {%- assign shipping_estimate_api = 'https://shxhid-shipping-proxy-production.up.railway.app/api/shipping-estimate' -%}
+  {%- assign shipping_estimate_currency = 'AED' -%}
+
+  <div class="shipping-estimate" id="shipping-estimate">
+    <h3 class="shipping-estimate__heading">Estimate shipping</h3>
+
+    <form class="shipping-estimate__form" id="shipping-estimate-form">
+      <div class="shipping-estimate__fields">
+        <div class="shipping-estimate__field">
+          <label for="shipping-estimate-country">Country</label>
+          <select id="shipping-estimate-country" name="country" required></select>
+        </div>
+        <div class="shipping-estimate__field">
+          <label for="shipping-estimate-city">City</label>
+          <select id="shipping-estimate-city" name="destinationCity" required></select>
+        </div>
+        <div class="shipping-estimate__field">
+          <label for="shipping-estimate-zip">
+            Zip / Postal Code <span class="shipping-estimate__optional">(optional)</span>
+          </label>
+          <input
+            type="text"
+            id="shipping-estimate-zip"
+            name="zip"
+            placeholder="Optional"
+            autocomplete="postal-code"
+            inputmode="numeric"
+          >
+        </div>
+      </div>
+
+      <button type="submit" class="shipping-estimate__submit" id="shipping-estimate-submit">
+        Calculate
+      </button>
+    </form>
+
+    <p class="shipping-estimate__note">
+      Prices are calculated by delivery city. ZIP/postal code is optional and not required for this estimate.
+    </p>
+
+    <div class="shipping-estimate__status" id="shipping-estimate-status" aria-live="polite"></div>
+
+    <ul class="shipping-estimate__results" id="shipping-estimate-results" hidden></ul>
+  </div>
+
+  <style>
+    .shipping-estimate {
+      margin-bottom: 1.5rem;
+      padding: 2rem;
+      background: #ececec;
+      border-radius: 12px;
+    }
+    .shipping-estimate__heading {
+      margin: 0 0 1.25rem;
+      font-size: 1.8rem;
+      font-weight: 700;
+    }
+    .shipping-estimate__fields {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+      gap: 1rem;
+      margin-bottom: 1.25rem;
+    }
+    .shipping-estimate__field {
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+    }
+    .shipping-estimate__field label {
+      font-size: 1.3rem;
+      font-weight: 500;
+    }
+    .shipping-estimate__optional {
+      font-weight: 400;
+      opacity: 0.6;
+    }
+    .shipping-estimate__field select,
+    .shipping-estimate__field input {
+      appearance: none;
+      -webkit-appearance: none;
+      width: 100%;
+      padding: 0.85rem 1.25rem;
+      border: none;
+      border-radius: 999px;
+      background-color: #fff;
+      font-size: 1.4rem;
+      color: #111;
+    }
+    .shipping-estimate__field select {
+      background-image: url("data:image/svg+xml;charset=UTF-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='%23555'%3E%3Cpath fill-rule='evenodd' d='M5.23 7.21a.75.75 0 011.06.02L10 11.19l3.71-3.96a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z' clip-rule='evenodd'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 1rem center;
+      background-size: 1.1rem;
+      padding-right: 2.75rem;
+    }
+    .shipping-estimate__field select:focus,
+    .shipping-estimate__field input:focus {
+      outline: 2px solid #ff7a1a;
+      outline-offset: 1px;
+    }
+    .shipping-estimate__submit {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0.9rem 2.25rem;
+      border: none;
+      border-radius: 999px;
+      background-color: #ff7a1a;
+      color: #fff;
+      font-weight: 700;
+      font-size: 1.4rem;
+      cursor: pointer;
+    }
+    .shipping-estimate__submit:disabled {
+      opacity: 0.6;
+      cursor: default;
+    }
+    .shipping-estimate__note {
+      margin: 0.9rem 0 0;
+      font-size: 1.15rem;
+      opacity: 0.65;
+    }
+    .shipping-estimate__status {
+      margin-top: 0.75rem;
+      font-size: 1.3rem;
+      opacity: 0.8;
+    }
+    .shipping-estimate__status[data-state='error'] {
+      color: #c0392b;
+      opacity: 1;
+    }
+    .shipping-estimate__results {
+      list-style: none;
+      margin: 1rem 0 0;
+      padding: 0;
+      display: grid;
+      gap: 0.5rem;
+    }
+    .shipping-estimate__option {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem;
+      padding: 0.75rem 1rem;
+      background: #fff;
+      border-radius: 8px;
+      font-size: 1.4rem;
+    }
+    .shipping-estimate__option-name {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-weight: 600;
+    }
+    .shipping-estimate__option-logo {
+      width: 24px;
+      height: 24px;
+      object-fit: contain;
+    }
+    .shipping-estimate__option-meta {
+      text-align: right;
+    }
+    .shipping-estimate__option-cod {
+      display: block;
+      font-size: 1.2rem;
+      opacity: 0.7;
+    }
+  </style>
+
+  <script>
+    (function () {
+      var API_URL = {{ shipping_estimate_api | json }};
+      var CURRENCY = {{ shipping_estimate_currency | json }};
+      var REQUEST_TIMEOUT_MS = 12000;
+
+      // Curated: countries/cities OTO's connected carriers can realistically
+      // quote from a Dubai origin. Expand this list any time — it only
+      // controls what's offered in the dropdowns, not what the API accepts
+      // (OTO takes a plain city name, nothing more).
+      var COUNTRY_CITIES = {
+        'United Arab Emirates': ['Dubai', 'Abu Dhabi', 'Sharjah', 'Ajman', 'Ras Al Khaimah', 'Fujairah', 'Umm Al Quwain', 'Al Ain'],
+        'Saudi Arabia': ['Riyadh', 'Jeddah', 'Dammam', 'Mecca', 'Medina', 'Khobar', 'Taif', 'Abha', 'Tabuk', 'Jubail'],
+        'Qatar': ['Doha'],
+        'Kuwait': ['Kuwait City'],
+        'Bahrain': ['Manama'],
+        'Oman': ['Muscat', 'Salalah'],
+        'Jordan': ['Amman'],
+        'Egypt': ['Cairo', 'Alexandria'],
+        'Turkey': ['Istanbul', 'Ankara', 'Izmir'],
+        'United States': ['New York', 'Los Angeles', 'Chicago', 'Houston', 'Miami'],
+        'United Kingdom': ['London', 'Manchester', 'Birmingham'],
+        'Germany': ['Berlin', 'Frankfurt', 'Munich'],
+        'France': ['Paris', 'Lyon'],
+        'Canada': ['Toronto', 'Vancouver'],
+        'Australia': ['Sydney', 'Melbourne'],
+        'India': ['Mumbai', 'Delhi', 'Bangalore'],
+        'Pakistan': ['Karachi', 'Lahore'],
+        'China': ['Shanghai', 'Beijing', 'Guangzhou']
+      };
+
+      var form = document.getElementById('shipping-estimate-form');
+      var countrySelect = document.getElementById('shipping-estimate-country');
+      var citySelect = document.getElementById('shipping-estimate-city');
+      var submitBtn = document.getElementById('shipping-estimate-submit');
+      var statusEl = document.getElementById('shipping-estimate-status');
+      var resultsEl = document.getElementById('shipping-estimate-results');
+
+      if (!form) return;
+
+      function populateCountries() {
+        Object.keys(COUNTRY_CITIES).forEach(function (country) {
+          var opt = document.createElement('option');
+          opt.value = country;
+          opt.textContent = country;
+          countrySelect.appendChild(opt);
+        });
+      }
+
+      function populateCities(country) {
+        citySelect.innerHTML = '';
+        (COUNTRY_CITIES[country] || []).forEach(function (city) {
+          var opt = document.createElement('option');
+          opt.value = city;
+          opt.textContent = city;
+          citySelect.appendChild(opt);
+        });
+      }
+
+      function clearResults() {
+        resultsEl.hidden = true;
+        resultsEl.innerHTML = '';
+        setStatus('');
+      }
+
+      populateCountries();
+      populateCities(countrySelect.value);
+
+      countrySelect.addEventListener('change', function () {
+        populateCities(countrySelect.value);
+        clearResults(); // destination changed — old quotes no longer apply
+      });
+      citySelect.addEventListener('change', clearResults);
+
+      function setStatus(text, state) {
+        statusEl.textContent = text || '';
+        if (state) {
+          statusEl.setAttribute('data-state', state);
+        } else {
+          statusEl.removeAttribute('data-state');
+        }
+      }
+
+      function formatMoney(amount) {
+        try {
+          return new Intl.NumberFormat(undefined, { style: 'currency', currency: CURRENCY }).format(amount);
+        } catch (e) {
+          return amount.toFixed(2) + ' ' + CURRENCY;
+        }
+      }
+
+      // OTO returns ETAs like "1to7WorkingDays" or "2-3 days". Make them human.
+      function formatEta(eta) {
+        if (!eta) return '';
+        var raw = String(eta).trim();
+        var m = raw.match(/^(\d+)\s*(?:to|[-–])\s*(\d+)\s*(working\s*)?days?$/i);
+        if (m) {
+          return m[1] + '–' + m[2] + (m[3] ? ' working days' : ' days');
+        }
+        // Fallback: split camelCase / digit boundaries so joined tokens read cleanly.
+        return raw
+          .replace(/([a-z])([A-Z])/g, '$1 $2')
+          .replace(/(\d)([A-Za-z])/g, '$1 $2')
+          .replace(/([A-Za-z])(\d)/g, '$1 $2')
+          .toLowerCase();
+      }
+
+      function renderOptions(options) {
+        resultsEl.innerHTML = '';
+
+        if (!options || !options.length) {
+          resultsEl.hidden = true;
+          setStatus('No delivery options found for that city.', 'error');
+          return;
+        }
+
+        options
+          .slice()
+          .sort(function (a, b) { return a.price - b.price; })
+          .forEach(function (opt) {
+            var li = document.createElement('li');
+            li.className = 'shipping-estimate__option';
+
+            var nameWrap = document.createElement('span');
+            nameWrap.className = 'shipping-estimate__option-name';
+
+            if (opt.logo) {
+              var img = document.createElement('img');
+              img.src = opt.logo;
+              img.alt = '';
+              img.loading = 'lazy';
+              img.className = 'shipping-estimate__option-logo';
+              img.onerror = function () { this.remove(); };
+              nameWrap.appendChild(img);
+            }
+
+            var nameText = document.createElement('span');
+            nameText.textContent = opt.name;
+            nameWrap.appendChild(nameText);
+
+            var meta = document.createElement('span');
+            meta.className = 'shipping-estimate__option-meta';
+
+            var eta = formatEta(opt.eta);
+            var priceLine = document.createElement('span');
+            priceLine.textContent = formatMoney(opt.price) + (eta ? ' · ' + eta : '');
+            meta.appendChild(priceLine);
+
+            if (opt.codCharge > 0) {
+              var codLine = document.createElement('span');
+              codLine.className = 'shipping-estimate__option-cod';
+              codLine.textContent = 'COD +' + formatMoney(opt.codCharge);
+              meta.appendChild(codLine);
+            }
+
+            li.appendChild(nameWrap);
+            li.appendChild(meta);
+            resultsEl.appendChild(li);
+          });
+
+        resultsEl.hidden = false;
+        setStatus('');
+      }
+
+      // POST to the proxy with a timeout; retry once on a network/timeout blip.
+      function postEstimate(payload, attempt) {
+        var controller = new AbortController();
+        var timeoutId = setTimeout(function () { controller.abort(); }, REQUEST_TIMEOUT_MS);
+
+        return fetch(API_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+          signal: controller.signal
+        })
+          .then(function (res) {
+            clearTimeout(timeoutId);
+            if (!res.ok) throw new Error('http_' + res.status);
+            return res.json();
+          })
+          .catch(function (err) {
+            clearTimeout(timeoutId);
+            var isNetwork = err instanceof TypeError || (err && err.name === 'AbortError');
+            if (isNetwork && attempt < 2) {
+              return new Promise(function (resolve) { setTimeout(resolve, 800); })
+                .then(function () { return postEstimate(payload, attempt + 1); });
+            }
+            throw err;
+          });
+      }
+
+      form.addEventListener('submit', function (event) {
+        event.preventDefault();
+
+        var destinationCity = citySelect.value;
+        if (!destinationCity) return;
+
+        submitBtn.disabled = true;
+        submitBtn.textContent = 'Checking…';
+        resultsEl.hidden = true;
+        resultsEl.setAttribute('aria-busy', 'true');
+        setStatus('Checking delivery options…');
+
+        fetch('/cart.js', { headers: { Accept: 'application/json' } })
+          .then(function (res) { return res.json(); })
+          .then(function (cart) {
+            // Prefer Shopify's computed total weight (grams); fall back to a manual sum.
+            var grams = (typeof cart.total_weight === 'number' && cart.total_weight > 0)
+              ? cart.total_weight
+              : cart.items.reduce(function (sum, item) { return sum + item.grams * item.quantity; }, 0);
+            var weightKg = Math.round((grams / 1000) * 1000) / 1000; // 3 dp, stabilises server cache key
+            if (!weightKg || weightKg <= 0) weightKg = 1;
+
+            return postEstimate({ destinationCity: destinationCity, weightKg: weightKg }, 1);
+          })
+          .then(function (data) {
+            renderOptions(data && data.options);
+          })
+          .catch(function (err) {
+            resultsEl.hidden = true;
+            if (window.console) console.error('[shipping-estimate]', err);
+            if (err instanceof TypeError) {
+              setStatus('Could not reach the shipping service. If you use an ad blocker or private DNS, please disable it for this site and try again.', 'error');
+            } else if (err && err.name === 'AbortError') {
+              setStatus('The shipping service took too long to respond. Please try again.', 'error');
+            } else {
+              setStatus('Could not fetch a shipping estimate right now. Please try again.', 'error');
+            }
+          })
+          .finally(function () {
+            submitBtn.disabled = false;
+            submitBtn.textContent = 'Calculate';
+            resultsEl.removeAttribute('aria-busy');
+          });
+      });
+    })();
+  </script>
+{%- endunless -%}
