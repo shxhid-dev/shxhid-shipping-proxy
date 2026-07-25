@@ -4,6 +4,7 @@ import cors from 'cors';
 import { rateLimit } from 'express-rate-limit';
 
 import { checkOTODeliveryFee, startProactiveRefresh, getTokenStatus } from './otoClient.js';
+import { logger } from './logger.js';
 
 const app = express();
 app.disable('x-powered-by'); // don't advertise the framework
@@ -43,7 +44,7 @@ const corsOptions = {
     if (!origin) return callback(null, true);
     if (ALLOWED_ORIGINS.length === 0) {
       // No allow-list configured yet: permit, but warn loudly in logs.
-      console.warn('[cors] ALLOWED_ORIGINS is empty — allowing all origins. Set it before going live.');
+      logger.warn('ALLOWED_ORIGINS is empty — allowing all origins. Set it before going live.');
       return callback(null, true);
     }
     if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
@@ -52,11 +53,24 @@ const corsOptions = {
   methods: ['POST', 'GET', 'OPTIONS'],
 };
 
-// ── Lightweight request logging (no secrets, no bodies) ─────────────────────
+// ── Request logging (no secrets, no bodies) ─────────────────────────────────
+// Each request gets a short id; the estimate handler stashes extra context on
+// res.locals.logMeta (city, weight, options, cache). Health probes and CORS
+// preflights are logged at debug so they don't drown the default-level logs.
+let reqCounter = 0;
 app.use((req, res, next) => {
+  req.id = (++reqCounter).toString(36);
   const start = Date.now();
   res.on('finish', () => {
-    console.log(`[req] ${req.method} ${req.originalUrl} ${res.statusCode} ${Date.now() - start}ms`);
+    const level = req.method === 'OPTIONS' || req.path === '/health' ? 'debug' : 'info';
+    logger[level]('request', {
+      id: req.id,
+      method: req.method,
+      path: req.originalUrl,
+      status: res.statusCode,
+      ms: Date.now() - start,
+      ...(res.locals.logMeta || {}),
+    });
   });
   next();
 });
@@ -80,9 +94,11 @@ const globalLimiter = rateLimit({
 app.use(globalLimiter);
 
 // Stricter limiter specifically for the public estimate endpoint.
+const ESTIMATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX) || 30;
+const ESTIMATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS) || 60_000;
 const estimateLimiter = rateLimit({
-  windowMs: Number(process.env.RATE_LIMIT_WINDOW_MS) || 60_000,
-  max: Number(process.env.RATE_LIMIT_MAX) || 30,
+  windowMs: ESTIMATE_LIMIT_WINDOW_MS,
+  max: ESTIMATE_LIMIT_MAX,
   standardHeaders: true,
   legacyHeaders: false,
   message: rateLimitMessage,
@@ -134,6 +150,7 @@ app.post('/api/shipping-estimate', estimateLimiter, async (req, res) => {
     const cacheKey = `${city.toLowerCase()}|${weight}|${due ?? ''}`;
     const cached = cacheGet(cacheKey);
     if (cached) {
+      res.locals.logMeta = { city, weightKg: weight, options: cached.length, cache: 'hit' };
       return res.json({ originCity: ORIGIN_CITY, destinationCity: city, weightKg: weight, options: cached, cached: true });
     }
 
@@ -149,9 +166,13 @@ app.post('/api/shipping-estimate', estimateLimiter, async (req, res) => {
     // hiccup and we don't want to pin "no options" for the whole TTL.
     if (options.length > 0) cacheSet(cacheKey, options);
 
+    res.locals.logMeta = { city, weightKg: weight, options: options.length, cache: 'miss' };
+    if (options.length === 0) {
+      logger.warn('estimate returned no options', { id: req.id, city, weightKg: weight });
+    }
     return res.json({ originCity: ORIGIN_CITY, destinationCity: city, weightKg: weight, options, cached: false });
   } catch (err) {
-    console.error('[estimate] error:', err.message);
+    logger.error('estimate failed', { id: req.id, error: err.message });
     // Never leak tokens or internal detail to the browser.
     return res.status(502).json({ error: 'Could not fetch a shipping estimate right now.' });
   }
@@ -169,7 +190,7 @@ app.use((req, res) => {
 // JSON response instead of Express's default HTML error page.
 app.use((err, req, res, _next) => {
   if (err && /not allowed by CORS/.test(err.message)) {
-    console.warn(`[cors] rejected origin: ${req.headers.origin}`);
+    logger.warn('CORS origin rejected', { origin: req.headers.origin });
     return res.status(403).json({ error: 'Origin not allowed.' });
   }
   // Body-parser throws for malformed JSON / oversized payloads.
@@ -179,14 +200,22 @@ app.use((err, req, res, _next) => {
   if (err && err.type === 'entity.too.large') {
     return res.status(413).json({ error: 'Request body too large.' });
   }
-  console.error('[error]', err.message);
+  logger.error('unhandled error', { error: err.message });
   return res.status(500).json({ error: 'Internal server error.' });
 });
 
 const server = app.listen(PORT, () => {
-  console.log(`oto-shipping-proxy listening on :${PORT} (origin city: ${ORIGIN_CITY})`);
+  logger.info('oto-shipping-proxy started', {
+    port: PORT,
+    originCity: ORIGIN_CITY,
+    allowedOrigins: ALLOWED_ORIGINS.length,
+    includeCod: INCLUDE_COD_IN_PRICE,
+    cacheTtlMs: CACHE_TTL_MS,
+    estimateLimit: `${ESTIMATE_LIMIT_MAX}/${Math.round(ESTIMATE_LIMIT_WINDOW_MS / 1000)}s`,
+    mock: String(process.env.OTO_MOCK).toLowerCase() === 'true',
+  });
   if (ALLOWED_ORIGINS.length === 0) {
-    console.warn('[startup] ALLOWED_ORIGINS is empty — CORS is open. Set it before going live.');
+    logger.warn('ALLOWED_ORIGINS is empty — CORS is open. Set it before going live.');
   }
   startProactiveRefresh();
 });
@@ -194,14 +223,14 @@ const server = app.listen(PORT, () => {
 // ── Graceful shutdown ─────────────────────────────────────────────────────
 // Railway sends SIGTERM on redeploy; drain in-flight requests, then exit.
 function shutdown(signal) {
-  console.log(`[shutdown] ${signal} received — closing server…`);
+  logger.info('shutdown signal received', { signal });
   server.close(() => {
-    console.log('[shutdown] server closed cleanly.');
+    logger.info('server closed cleanly');
     process.exit(0);
   });
   // Don't hang forever if a connection won't close.
   setTimeout(() => {
-    console.warn('[shutdown] forced exit after timeout.');
+    logger.warn('forced exit after shutdown timeout');
     process.exit(1);
   }, 10_000).unref();
 }
