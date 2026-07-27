@@ -73,6 +73,8 @@ Key ones:
 | `OTO_TIMEOUT_MS`       | Per-request timeout on OTO calls (default 10000).                     |
 | `OTO_MAX_RETRIES`      | Retries on transient OTO network failures/timeouts (default 2).       |
 | `MAX_WEIGHT_KG`        | Reject `weightKg` above this before calling OTO (default 1000).       |
+| `LOG_LEVEL`            | `error` \| `warn` \| `info` \| `debug` (default `info`). `debug` also shows health/preflight requests. |
+| `LOG_JSON`             | `true` = one JSON object per log line (for log aggregators). Default human-readable. |
 | `OTO_MOCK`             | `true` = return canned data with no token. **Local dev only.**        |
 
 ---
@@ -134,7 +136,22 @@ so its secrets and scaling stay isolated.
 
 ## Storefront integration
 
-The cart-page widget (city selector + fetch call) lives in the Shopify theme,
-in `sections/main-cart-footer.liquid` via a rendered snippet. It computes total
-weight from `/cart.js` (`grams × quantity`, ÷ 1000 → kg) and POSTs
-`{ destinationCity, weightKg }` to this proxy's Railway URL. See the theme repo.
+The cart-page widget lives in **[`storefront/shipping-estimate.liquid`](storefront/shipping-estimate.liquid)**
+— this repo is its source of truth so frontend and backend stay in sync.
+
+To deploy it to the Shopify theme:
+
+1. Copy `storefront/shipping-estimate.liquid` into the theme at
+   `snippets/shipping-estimate.liquid`.
+2. Render it from `sections/main-cart-footer.liquid`:
+   ```liquid
+   {% render 'shipping-estimate' %}
+   ```
+3. Update the `shipping_estimate_api` URL at the top of the snippet if the
+   Railway domain changes.
+
+The widget reads total weight from `/cart.js` (`cart.total_weight`, ÷ 1000 → kg),
+POSTs `{ destinationCity, weightKg }` to this proxy, and renders the carrier
+options. It has a 12s timeout with one retry, distinguishes network/ad-blocker
+failures from server errors, and prettifies OTO's ETA strings
+(e.g. `1to7WorkingDays` → `1–7 working days`).

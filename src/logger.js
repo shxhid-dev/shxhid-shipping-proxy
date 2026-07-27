@@ -1,3 +1,10 @@
+// Tiny dependency-free structured logger.
+//
+// - LOG_LEVEL (error|warn|info|debug, default info) controls verbosity.
+// - LOG_JSON=true emits one JSON object per line for log aggregators;
+//   otherwise a human-readable "TS LEVEL msg key=val" line for Railway.
+// Errors/warnings go to stderr, everything else to stdout.
+
 const LEVELS = { error: 0, warn: 1, info: 2, debug: 3 };
 const LEVEL = LEVELS[(process.env.LOG_LEVEL || 'info').toLowerCase()] ?? LEVELS.info;
 const JSON_LOGS = String(process.env.LOG_JSON).toLowerCase() === 'true';
