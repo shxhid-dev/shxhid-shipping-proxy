@@ -73,6 +73,8 @@ Key ones:
 | `OTO_TIMEOUT_MS`       | Per-request timeout on OTO calls (default 10000).                     |
 | `OTO_MAX_RETRIES`      | Retries on transient OTO network failures/timeouts (default 2).       |
 | `MAX_WEIGHT_KG`        | Reject `weightKg` above this before calling OTO (default 1000).       |
+| `LOG_LEVEL`            | `error` \| `warn` \| `info` \| `debug` (default `info`). `debug` also shows health/preflight requests. |
+| `LOG_JSON`             | `true` = one JSON object per log line (for log aggregators). Default human-readable. |
 | `OTO_MOCK`             | `true` = return canned data with no token. **Local dev only.**        |
 
 ---
